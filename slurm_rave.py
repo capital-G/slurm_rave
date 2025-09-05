@@ -112,7 +112,7 @@ nvidia-smi
 
 source ~/venv/bin/activate
 
-rave train --config @MODEL_VERSION --db_path @DATASET_DIR--out_path @OUT_DIR --max_steps 4000000 --name @JOB_NAME --channels 1
+rave train --config @MODEL_VERSION --db_path @DATASET_DIR --out_path @OUT_DIR --max_steps 4000000 --name @JOB_NAME --channels 1
 
 rave export --run @OUT_DIR --fidelity 0.99 --name @JOB_NAME --output @EXPORT_DIR
 """
