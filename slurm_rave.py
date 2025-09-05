@@ -4,7 +4,6 @@ from string import Template
 import subprocess
 from typing import List
 import re
-import os
 
 import click
 import questionary
@@ -13,8 +12,7 @@ VERSION = "0.1.0"
 
 RAVE_JOBS_DIR = Path("~/rave_jobs").expanduser()
 RAVE_JOBS_DIR.mkdir(exist_ok=True, parents=True)
-
-DATASET_PREFIX_COMMAND = r'PATH="$PATH":~/ffmpeg-git-20240629-amd64'
+RAVE_BIN = Path("~/slurm_rave/.venv/bin/rave").expanduser()
 
 
 class ModelVersion(enum.Enum):
@@ -22,7 +20,16 @@ class ModelVersion(enum.Enum):
     v3 = "v3"
 
 
+RAVE_DATASET_SCRIPT = r"""
+set -e
+
+PATH="$PATH":/home/gx547144/ffmpeg-git-20240629-amd64-static {COMMAND}
+"""
+
+
 class RaveDataset:
+    """The dataset gets rendered by our RAVE environment."""
+
     def __init__(self, paths: List[Path], name: str, out_dir: Path):
         self.paths = paths
         self.name = name
@@ -35,16 +42,23 @@ class RaveDataset:
 
         args: List[str] = []
 
-        if DATASET_PREFIX_COMMAND:
-            args.append(DATASET_PREFIX_COMMAND)
-
-        args.extend(["rave", "preprocess"])
+        args.extend([str(RAVE_BIN.absolute()), "preprocess"])
         for path in self.paths:
             args.extend(["--input_path", str(path.absolute())])
         args.extend(["--output_path", str(self.out_dir.absolute())])
+
+        script = RAVE_DATASET_SCRIPT.format(
+            COMMAND=" ".join([str(arg) for arg in args])
+        )
+
+        print(script)
         try:
             subprocess.check_output(
-                args,
+                script,
+                shell=True,
+                executable="/usr/bin/zsh",
+                text=True,
+                env={},
             )
         except subprocess.CalledProcessError as e:
             click.echo(
@@ -77,7 +91,7 @@ RAVE_SCRIPT_TEMPLATE = r"""#!/usr/bin/zsh
 #SBATCH --time=72:00:00             # max. run time of the job
 #SBATCH --job-name=@JOB_NAME    # set the job name
 #SBATCH --output=stdout_@JOB_NAME%j.txt      # redirects stdout and stderr to stdout.txt
-#SBATCH --account=@USER
+#SBATCH --account=rwth1852
 
 ############################################################
 ### Parameters and Settings
@@ -98,8 +112,9 @@ nvidia-smi
 
 source ~/venv/bin/activate
 
-rave train --config @MODEL_VERSION --db_path @DATASET_DIR--out_path @OUT_DIR --name @JOB_NAME --channels 1
+rave train --config @MODEL_VERSION --db_path @DATASET_DIR--out_path @OUT_DIR --max_steps 4000000 --name @JOB_NAME --channels 1
 
+rave export --run @OUT_DIR --fidelity 0.99 --name @JOB_NAME --output @EXPORT_DIR
 """
 
 
@@ -134,7 +149,6 @@ class RaveModel:
                 "OUT_DIR": out_dir,
                 "EXPORT_DIR": export_dir,
                 "MODEL_VERSION": self.model_version,
-                "USER": os.environ["USER"],
                 "JOB_NAME": self.job_name,
             }
         )
@@ -144,12 +158,14 @@ class RaveModel:
         with shell_script_path.open("w") as f:
             f.write(script)
 
-        shell_script_path.chmod(755)  # this is hopefully +x ^^
+        subprocess.run(["chmod", "+x", shell_script_path.absolute()], check=True)
 
         try:
-            subprocess.check_output(
-                ["sbatch", str(shell_script_path.absolute())], cwd=self.project_dir
+            out = subprocess.check_output(
+                ["sbatch", str(shell_script_path.absolute())],
+                cwd=self.project_dir,
             )
+            click.echo(out)
         except subprocess.CalledProcessError as e:
             click.echo(
                 click.style(
