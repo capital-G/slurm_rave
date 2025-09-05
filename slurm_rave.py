@@ -51,7 +51,6 @@ class RaveDataset:
             COMMAND=" ".join([str(arg) for arg in args])
         )
 
-        print(script)
         try:
             subprocess.check_output(
                 script,
