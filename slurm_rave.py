@@ -4,6 +4,7 @@ from string import Template
 import subprocess
 from typing import List
 import re
+import os
 
 import click
 import questionary
@@ -13,7 +14,7 @@ VERSION = "0.1.0"
 RAVE_JOBS_DIR = Path("~/rave_jobs").expanduser()
 RAVE_JOBS_DIR.mkdir(exist_ok=True, parents=True)
 
-DATASET_PREFIX_COMMAND = "ffmpeg=/foo/bar"
+DATASET_PREFIX_COMMAND = r'PATH="$PATH":~/ffmpeg-git-20240629-amd64'
 
 
 class ModelVersion(enum.Enum):
@@ -60,25 +61,61 @@ class RaveDataset:
         )
 
 
-RAVE_SCRIPT_TEMPLATE = """#!/bin/zsh
+RAVE_SCRIPT_TEMPLATE = r"""#!/usr/bin/zsh
 
+############################################################
+### Slurm flags
+############################################################
 
+#SBATCH --partition=c23g            # request partition with GPU nodes
+#SBATCH --nodes=1                   # request desired number of nodes
+#SBATCH --ntasks-per-node=1         # request desired number of processes (or MPI tasks)
+
+#SBATCH --cpus-per-task=8          # request desired number of CPU cores or threads per process (default: 1)
+
+#SBATCH --gres=gpu:1                # specify desired number of GPUs per node
+#SBATCH --time=72:00:00             # max. run time of the job
+#SBATCH --job-name=@JOB_NAME    # set the job name
+#SBATCH --output=stdout_@JOB_NAME%j.txt      # redirects stdout and stderr to stdout.txt
+#SBATCH --account=@USER
+
+############################################################
+### Parameters and Settings
+############################################################
+
+# load modules
+module load GCCcore/11.3.0
+module load Python/3.10.4
+
+# print some information about current system
+echo "Job nodes: ${SLURM_JOB_NODELIST}"
+echo "Current machine: $(hostname)"
+nvidia-smi
+
+############################################################
+### Setup
+############################################################
+
+source ~/venv/bin/activate
+
+rave train --config @MODEL_VERSION --db_path @DATASET_DIR--out_path @OUT_DIR --name @JOB_NAME --channels 1
 
 """
 
 
 class RaveTemplate(Template):
-    delimiter = "±"
+    delimiter = "@"
 
 
 class RaveModel:
     def __init__(
         self,
+        job_name: str,
         model_version: ModelVersion,
         dataset_dir: Path,
         project_dir: Path,
-        rave_version: ModelVersion,
     ):
+        self.job_name = job_name
         self.model_version = model_version
         self.dataset_dir = dataset_dir
         self.project_dir = project_dir
@@ -97,6 +134,8 @@ class RaveModel:
                 "OUT_DIR": out_dir,
                 "EXPORT_DIR": export_dir,
                 "MODEL_VERSION": self.model_version,
+                "USER": os.environ["USER"],
+                "JOB_NAME": self.job_name,
             }
         )
 
@@ -106,6 +145,19 @@ class RaveModel:
             f.write(script)
 
         shell_script_path.chmod(755)  # this is hopefully +x ^^
+
+        try:
+            subprocess.check_output(
+                ["sbatch", str(shell_script_path.absolute())], cwd=self.project_dir
+            )
+        except subprocess.CalledProcessError as e:
+            click.echo(
+                click.style(
+                    f"Failed to submit slurm job: {e.returncode}: {e.stderr}", fg="red"
+                )
+            )
+            raise e
+        click.echo(click.style("Successfully submitted job to SLURM", fg="green"))
 
 
 def get_dataset_dirs(wav_paths: List[Path]) -> List[Path]:
@@ -186,7 +238,7 @@ def get_job_name(job_name: str, project_base_path: Path) -> str:
 )
 def main(
     wav_paths: List[Path],
-    rave_version: ModelVersion | None,
+    rave_version: ModelVersion,
     job_name: str,
     project_base_path: Path,
 ):
@@ -201,8 +253,11 @@ def main(
     project_path = project_base_path.joinpath(job_name)
     click.echo(f"Use project dir {project_path}")
 
+    dataset_path = project_path.joinpath("dataset")
     rave_dataset = RaveDataset(
-        paths=wav_paths, name=job_name, out_dir=project_path.joinpath("dataset")
+        paths=wav_paths,
+        name=job_name,
+        out_dir=dataset_path,
     )
     rave_dataset.build_dataset()
 
@@ -211,6 +266,14 @@ def main(
             "Select a model architecture", choices=ModelVersion._member_names_
         ).ask()
     click.echo(click.style(f"Using model {rave_version}"))
+
+    rave_model = RaveModel(
+        job_name=job_name,
+        model_version=rave_version,
+        dataset_dir=dataset_path,
+        project_dir=project_path,
+    )
+    rave_model.send_job_to_slurm()
 
 
 if __name__ == "__main__":
