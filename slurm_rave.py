@@ -1,0 +1,217 @@
+from pathlib import Path
+import enum
+from string import Template
+import subprocess
+from typing import List
+import re
+
+import click
+import questionary
+
+VERSION = "0.1.0"
+
+RAVE_JOBS_DIR = Path("~/rave_jobs").expanduser()
+RAVE_JOBS_DIR.mkdir(exist_ok=True, parents=True)
+
+DATASET_PREFIX_COMMAND = "ffmpeg=/foo/bar"
+
+
+class ModelVersion(enum.Enum):
+    v2 = "v2"
+    v3 = "v3"
+
+
+class RaveDataset:
+    def __init__(self, paths: List[Path], name: str, out_dir: Path):
+        self.paths = paths
+        self.name = name
+        self.out_dir = out_dir
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+
+    def build_dataset(self):
+        """Prepares the building a dataset command."""
+        click.echo("Generating the dataset...")
+
+        args: List[str] = []
+
+        if DATASET_PREFIX_COMMAND:
+            args.append(DATASET_PREFIX_COMMAND)
+
+        args.extend(["rave", "preprocess"])
+        for path in self.paths:
+            args.extend(["--input_path", str(path.absolute())])
+        args.extend(["--output_path", str(self.out_dir.absolute())])
+        try:
+            subprocess.check_output(
+                args,
+            )
+        except subprocess.CalledProcessError as e:
+            click.echo(
+                click.style(
+                    f"Dataset generation failed: {e.returncode}: {e.stderr}", fg="red"
+                )
+            )
+            raise e
+
+        click.echo(
+            click.style(
+                f"Successfully generated the dataset ({self.out_dir})", fg="green"
+            )
+        )
+
+
+RAVE_SCRIPT_TEMPLATE = """#!/bin/zsh
+
+
+
+"""
+
+
+class RaveTemplate(Template):
+    delimiter = "±"
+
+
+class RaveModel:
+    def __init__(
+        self,
+        model_version: ModelVersion,
+        dataset_dir: Path,
+        project_dir: Path,
+        rave_version: ModelVersion,
+    ):
+        self.model_version = model_version
+        self.dataset_dir = dataset_dir
+        self.project_dir = project_dir
+        self.model_version = model_version
+
+    def send_job_to_slurm(self):
+        out_dir = self.project_dir.joinpath("model")
+        out_dir.mkdir(exist_ok=True, parents=True)
+
+        export_dir = self.project_dir.joinpath("export")
+        export_dir.mkdir(exist_ok=True, parents=True)
+
+        script = RaveTemplate(RAVE_SCRIPT_TEMPLATE).substitute(
+            {
+                "DATASET_DIR": self.dataset_dir,
+                "OUT_DIR": out_dir,
+                "EXPORT_DIR": export_dir,
+                "MODEL_VERSION": self.model_version,
+            }
+        )
+
+        shell_script_path = self.project_dir.joinpath("job.sh")
+
+        with shell_script_path.open("w") as f:
+            f.write(script)
+
+        shell_script_path.chmod(755)  # this is hopefully +x ^^
+
+
+def get_dataset_dirs(wav_paths: List[Path]) -> List[Path]:
+    continue_asking = len(wav_paths) <= 0
+    while continue_asking:
+        wav_path = questionary.path(
+            "Add a directory with wave files",
+            only_directories=True,
+        ).ask()
+
+        wav_path_name = Path(wav_path)
+        if wav_path_name.is_dir():
+            click.echo(f"Adding {wav_path_name.absolute()} to dataset")
+            wav_paths.append(wav_path_name.absolute())
+            continue_asking = questionary.confirm("Add another directory?").ask()
+        else:
+            click.echo(click.style("This is not a valid directory", fg="red"))
+    return wav_paths
+
+
+def get_job_name(job_name: str, project_base_path: Path) -> str:
+    job_name = (
+        job_name or ""
+    )  # just to get sure that we are actually working on a string...
+    job_regex = re.compile(r"^[a-zA-Z0-9-_]+$")
+
+    while True:
+        job_name = questionary.text(
+            "What is the name of the job?", instruction="Use only A-z 0-9 and -_"
+        ).ask()
+        if job_regex.match(job_name) is None:
+            click.echo(click.style("This is not a valid job name!", fg="red"))
+        elif project_base_path.joinpath(job_name).exists():
+            click.echo(click.style("Project directory already exists", fg="red"))
+        else:
+            break
+
+    return job_name
+
+
+@click.command()
+@click.option(
+    "--wav-path",
+    "-p",
+    "wav_paths",
+    multiple=True,
+    help="Directory containing WAV files - allows multiple mentions",
+    type=click.Path(
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        resolve_path=True,
+        path_type=Path,
+    ),
+)
+@click.option(
+    "--rave-version",
+    help="Rave architecture version to use (v2/v3)",
+    type=ModelVersion,
+)
+@click.option(
+    "--name",
+    "job_name",
+    help="Name of the RAVE model and slurm job",
+)
+@click.option(
+    "--project-dir",
+    "project_base_path",
+    help="Directory where the generated RAVE project files should be stored",
+    type=click.Path(
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        resolve_path=True,
+        path_type=Path,
+    ),
+    default=RAVE_JOBS_DIR,
+)
+def main(
+    wav_paths: List[Path],
+    rave_version: ModelVersion | None,
+    job_name: str,
+    project_base_path: Path,
+):
+    wav_paths = list(wav_paths)  # hack: click actually returns a tuple here...
+    click.echo(
+        click.style(f"Welcome to slurm_rave {VERSION}", bold=True, fg="red", bg="green")
+    )
+
+    job_name = get_job_name(job_name, project_base_path)
+    wav_paths = get_dataset_dirs(wav_paths)
+
+    project_path = project_base_path.joinpath(job_name)
+    click.echo(f"Use project dir {project_path}")
+
+    rave_dataset = RaveDataset(
+        paths=wav_paths, name=job_name, out_dir=project_path.joinpath("dataset")
+    )
+    rave_dataset.build_dataset()
+
+    if not rave_version:
+        rave_version = questionary.select(
+            "Select a model architecture", choices=ModelVersion._member_names_
+        ).ask()
+    click.echo(click.style(f"Using model {rave_version}"))
+
+
+if __name__ == "__main__":
+    main()
